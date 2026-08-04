@@ -167,6 +167,19 @@ PY
 sed -i -E "s/torch==([0-9.]+)\+cpu/torch==\1/g" requirements/cpu.txt
 echo "--- patched requirements/cpu.txt ---"
 grep -E "^torch" requirements/cpu.txt || true
+
+# Patch csrc/cpu/sgl-kernels/fla.cpp: it initialises a constexpr float from
+# std::sqrt, which is not constexpr in libc++ before C++26. GCC accepts it
+# as a builtin so Linux is unaffected today, but keep the two build scripts
+# in step so a compiler change does not surprise us. D is a template
+# parameter, so const is semantically identical and still folds.
+FLA_SRC="csrc/cpu/sgl-kernels/fla.cpp"
+if [ -f "$FLA_SRC" ] \
+        && grep -q "constexpr float scale = 1\.f / std::sqrt" "$FLA_SRC"; then
+    sed -i -E "s/constexpr( float scale = 1\.f \/ std::sqrt)/const\1/" "$FLA_SRC"
+    echo "--- patched $FLA_SRC (constexpr -> const) ---"
+    grep -n "float scale = 1\.f / std::sqrt" "$FLA_SRC" || true
+fi
 '
 
 log "Installing build deps + torch(cpu) inside container..."
@@ -188,7 +201,16 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 # Plain torch (cpu) so setup.py can `import torch`.
 pip install "numpy<2" >/dev/null
-pip install torch==2.11.0 \
+# Build against exactly the torch this wheel will declare as a dependency.
+# This used to be hardcoded to 2.11.0 while the declared version tracked
+# upstream requirements/cpu.txt; when upstream moved to 2.13.0 the macOS
+# wheel still linked against 2.11 and its _C.abi3.so ended up referencing a
+# c10 symbol the installed torch does not export. Absolute path because this
+# step does not cd into the source tree.
+TORCH_REQ="$(grep -E "^torch==" /src/vllm/requirements/cpu.txt | head -1)"
+: "${TORCH_REQ:?no torch== pin found in /src/vllm/requirements/cpu.txt}"
+echo "building against ${TORCH_REQ}"
+pip install "${TORCH_REQ}" \
     --extra-index-url https://download.pytorch.org/whl/cpu >/dev/null
 '
 
@@ -205,6 +227,11 @@ run "
     export CC=gcc-12 CXX=g++-12
     export SETUPTOOLS_SCM_PRETEND_VERSION='${NIGHTLY_VER}'
     export VLLM_VERSION_OVERRIDE='${NIGHTLY_VER}'
+    # vLLM's setup.py defaults to RelWithDebInfo (-O2 -g). The debug symbols
+    # pushed this wheel from 96 MiB to 105 MiB, past PyPI's 100 MiB per-file
+    # limit, and uploads have been failing with an opaque 400 ever since.
+    # Release keeps the optimisation without the symbols.
+    export CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE:-Release}'
     export MAX_JOBS=\$(nproc)
     rm -rf /src/vllm/build /src/vllm/dist
     python setup.py bdist_wheel --plat-name manylinux_2_28_x86_64
@@ -213,8 +240,77 @@ run "
     twine check /out/*.whl
 "
 
+# `twine check` only validates metadata, so it happily passes a wheel whose
+# compiled extension cannot resolve its libtorch symbols. dlopen every .so
+# for real instead. Loading the extension directly (rather than
+# `import vllm._C`) keeps this independent of vLLM's runtime dependencies:
+# importing torch first is enough to bring libc10/libtorch into the process.
+log "Verifying the built extension actually loads..."
+run '
+set -euo pipefail
+. /opt/venv/bin/activate
+python - /out <<"PYEOF"
+import ctypes
+import glob
+import sys
+import tempfile
+import zipfile
+
+import torch  # noqa: F401  -- must be imported first to load libtorch
+
+# An unresolved *symbol* means the extension was compiled against a
+# different libtorch than the one it declares -- that must never ship.
+# A missing *library* is a different (also real) problem: the extension
+# links a build-host library that was not bundled into the wheel. Warn
+# about it rather than blocking the publish, so the two failure modes stay
+# distinguishable.
+FATAL = ("symbol not found", "undefined symbol")
+
+wheels = glob.glob(sys.argv[1] + "/*.whl")
+assert wheels, "no wheel found in " + sys.argv[1]
+problems = []
+for whl in wheels:
+    with zipfile.ZipFile(whl) as z, tempfile.TemporaryDirectory() as tmp:
+        sos = [n for n in z.namelist() if n.endswith(".so")]
+        assert sos, "no extension modules inside " + whl
+        for name in sos:
+            try:
+                ctypes.CDLL(z.extract(name, tmp))
+                print("dlopen ok:", name)
+            except OSError as exc:
+                msg = str(exc)
+                if any(f in msg.lower() for f in FATAL):
+                    problems.append(name + ": " + msg)
+                    print("dlopen FAILED (ABI):", name)
+                else:
+                    print("WARNING: dlopen failed, unbundled library?", name)
+                print("   ", msg.strip().splitlines()[0])
+if problems:
+    sys.exit(
+        "ABI check failed -- the extension does not match the torch this "
+        "wheel declares:\n" + "\n".join(problems)
+    )
+PYEOF
+'
+
 log "Wheels staged on host:"
 ls -lh "${HOST_OUT_DIR}"
+
+# PyPI rejects files larger than 100 MiB with an opaque "400 Bad Request".
+# This wheel sat ~3 MiB below that ceiling for weeks, crossed it on
+# 2026-07-20, and every upload failed silently for the next twelve nights.
+# Fail here with an actionable message instead.
+PYPI_MAX_BYTES=$((100 * 1024 * 1024))
+for whl in "${HOST_OUT_DIR}"/*.whl; do
+    size="$(wc -c <"${whl}")"
+    printf '  %s: %d MiB\n' "$(basename "${whl}")" "$((size / 1024 / 1024))"
+    if [[ "${size}" -gt "${PYPI_MAX_BYTES}" ]]; then
+        echo "[ERROR] $(basename "${whl}") is $((size / 1024 / 1024)) MiB," \
+            "over PyPI's 100 MiB per-file limit. Shrink the build (check" \
+            "CMAKE_BUILD_TYPE) or publish somewhere without a size cap." >&2
+        exit 1
+    fi
+done
 
 if [[ "${SKIP_UPLOAD}" == "1" ]]; then
     log "SKIP_UPLOAD=1 -> stopping before twine upload."
