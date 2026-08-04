@@ -205,10 +205,29 @@ pip install "numpy<2" >/dev/null
 # This used to be hardcoded to 2.11.0 while the declared version tracked
 # upstream requirements/cpu.txt; when upstream moved to 2.13.0 the macOS
 # wheel still linked against 2.11 and its _C.abi3.so ended up referencing a
-# c10 symbol the installed torch does not export. Absolute path because this
-# step does not cd into the source tree.
-TORCH_REQ="$(grep -E "^torch==" /src/vllm/requirements/cpu.txt | head -1)"
-: "${TORCH_REQ:?no torch== pin found in /src/vllm/requirements/cpu.txt}"
+# c10 symbol the installed torch does not export.
+#
+# requirements/cpu.txt carries one torch line per platform group, each
+# guarded by an environment marker, so taking the first match can pick a pin
+# meant for another architecture -- pip then evaluates the marker, skips the
+# install and still exits 0, leaving the build to fail with "No module named
+# torch". Let packaging evaluate the markers and pick the applicable pin.
+# Absolute path because this step does not cd into the source tree.
+TORCH_REQ="$(python - <<"PYEOF"
+from packaging.requirements import Requirement
+
+with open("/src/vllm/requirements/cpu.txt") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if not line.startswith("torch=="):
+            continue
+        req = Requirement(line)
+        if req.marker is None or req.marker.evaluate():
+            print(req.name + str(req.specifier))
+            break
+PYEOF
+)"
+: "${TORCH_REQ:?no applicable torch== pin in /src/vllm/requirements/cpu.txt}"
 echo "building against ${TORCH_REQ}"
 pip install "${TORCH_REQ}" \
     --extra-index-url https://download.pytorch.org/whl/cpu >/dev/null
