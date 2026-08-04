@@ -259,56 +259,60 @@ run "
     twine check /out/*.whl
 "
 
-# `twine check` only validates metadata, so it happily passes a wheel whose
-# compiled extension cannot resolve its libtorch symbols. dlopen every .so
-# for real instead. Loading the extension directly (rather than
-# `import vllm._C`) keeps this independent of vLLM's runtime dependencies:
-# importing torch first is enough to bring libc10/libtorch into the process.
-log "Verifying the built extension actually loads..."
+# `twine check` only validates metadata, so it would happily pass a wheel
+# built against a different torch than it declares -- the exact defect that
+# shipped on 2026-07-30. Compare the two versions directly.
+#
+# Do NOT try to dlopen the extensions to verify this. vLLM builds several
+# ISA-specialised variants (_C, _C_AVX2, _C_AVX512) and the default one is
+# compiled with -mavx512* -mamx-*; loading it on a host that lacks those
+# instructions, or that has not requested AMX state via arch_prctl, dies with
+# SIGILL and tells us nothing about the ABI. vLLM picks a variant at runtime
+# after probing the CPU, so "every .so dlopens here" was never the right
+# invariant.
+log "Verifying the wheel declares the torch it was built against..."
 run '
 set -euo pipefail
 . /opt/venv/bin/activate
 python - /out <<"PYEOF"
-import ctypes
 import glob
 import sys
-import tempfile
 import zipfile
 
-import torch  # noqa: F401  -- must be imported first to load libtorch
+import torch
 
-# An unresolved *symbol* means the extension was compiled against a
-# different libtorch than the one it declares -- that must never ship.
-# A missing *library* is a different (also real) problem: the extension
-# links a build-host library that was not bundled into the wheel. Warn
-# about it rather than blocking the publish, so the two failure modes stay
-# distinguishable.
-FATAL = ("symbol not found", "undefined symbol")
 
+def normalize(version):
+    """Drop the PEP 440 local label, e.g. 2.13.0+cpu -> 2.13.0."""
+    return version.split("+")[0]
+
+
+built = normalize(torch.__version__)
 wheels = glob.glob(sys.argv[1] + "/*.whl")
-assert wheels, "no wheel found in " + sys.argv[1]
-problems = []
+if not wheels:
+    sys.exit("no wheel found in " + sys.argv[1])
+
 for whl in wheels:
-    with zipfile.ZipFile(whl) as z, tempfile.TemporaryDirectory() as tmp:
-        sos = [n for n in z.namelist() if n.endswith(".so")]
-        assert sos, "no extension modules inside " + whl
-        for name in sos:
-            try:
-                ctypes.CDLL(z.extract(name, tmp))
-                print("dlopen ok:", name)
-            except OSError as exc:
-                msg = str(exc)
-                if any(f in msg.lower() for f in FATAL):
-                    problems.append(name + ": " + msg)
-                    print("dlopen FAILED (ABI):", name)
-                else:
-                    print("WARNING: dlopen failed, unbundled library?", name)
-                print("   ", msg.strip().splitlines()[0])
-if problems:
-    sys.exit(
-        "ABI check failed -- the extension does not match the torch this "
-        "wheel declares:\n" + "\n".join(problems)
-    )
+    with zipfile.ZipFile(whl) as z:
+        names = [n for n in z.namelist() if n.endswith(".dist-info/METADATA")]
+        if not names:
+            sys.exit("no METADATA in " + whl)
+        text = z.read(names[0]).decode("utf-8", "replace")
+
+    declared = set()
+    for line in text.splitlines():
+        if line.startswith("Requires-Dist: torch=="):
+            spec = line.split("==", 1)[1].split(";")[0].strip()
+            declared.add(normalize(spec))
+
+    if not declared:
+        sys.exit(whl + " declares no pinned torch requirement")
+    if declared != {built}:
+        sys.exit(
+            "ABI mismatch: built against torch %s but the wheel declares %s"
+            % (built, ", ".join(sorted(declared)))
+        )
+    print("torch matches: built against and declares %s" % built)
 PYEOF
 '
 
