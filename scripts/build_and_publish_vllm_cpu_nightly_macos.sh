@@ -189,8 +189,30 @@ pip install "numpy<2" >/dev/null
 # still linked against 2.11 and `_C.abi3.so` ended up referencing a c10
 # symbol the installed torch does not export. `import vllm` still worked,
 # so the breakage only showed up when the first CPU worker started.
-TORCH_REQ="$(grep -E '^torch==' requirements/cpu.txt | head -1)"
-: "${TORCH_REQ:?no 'torch==' pin found in requirements/cpu.txt}"
+#
+# requirements/cpu.txt carries one torch line per platform group, each
+# guarded by an environment marker, e.g.
+#   torch==2.13.0; platform_machine == "x86_64" or ... "aarch64"
+#   torch==2.13.0; platform_system == "Darwin" or ... "riscv64"
+# Taking the first match installed the x86_64 line on arm64, where pip
+# evaluated the marker, skipped the install and still exited 0 -- the build
+# then died with "No module named 'torch'". Let packaging evaluate the
+# markers and hand us the pin that applies to this host.
+TORCH_REQ="$(python - <<'PY'
+from packaging.requirements import Requirement
+
+with open("requirements/cpu.txt") as f:
+    for line in f:
+        line = line.split("#", 1)[0].strip()
+        if not line.startswith("torch=="):
+            continue
+        req = Requirement(line)
+        if req.marker is None or req.marker.evaluate():
+            print(req.name + str(req.specifier))
+            break
+PY
+)"
+: "${TORCH_REQ:?no applicable 'torch==' pin in requirements/cpu.txt}"
 log "  building against ${TORCH_REQ}"
 pip install "${TORCH_REQ}" >/dev/null
 
