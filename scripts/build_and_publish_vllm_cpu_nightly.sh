@@ -25,6 +25,12 @@
 #   5. Twine-upload to PyPI using the API token from
 #      /data/home/baoloongmao/pypi_apikey.
 #
+# The steps that are identical to the macOS build (build_and_publish_
+# vllm_cpu_nightly_macos.sh) live under scripts/common/ and are mounted
+# read-only into the build container so both scripts execute the exact same
+# code -- see the `-v ".../common:/opt/vllm-cpu-nightly-common:ro"` docker
+# flag below.
+#
 # Usage (on the devcloud host):
 #   bash build_and_publish_vllm_cpu_nightly.sh
 #
@@ -37,15 +43,17 @@
 # ----------------------------------------------------------------------------
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="${SCRIPT_DIR}/common"
+# shellcheck source=common/helpers.sh
+source "${COMMON_DIR}/helpers.sh"
+
 PYPI_TOKEN_FILE="${PYPI_TOKEN_FILE:-/data/home/baoloongmao/pypi_apikey}"
 PKG_NAME="${PKG_NAME:-vllm-cpu-nightly}"
 VLLM_GIT_REF="${VLLM_GIT_REF:-main}"
 SKIP_UPLOAD="${SKIP_UPLOAD:-0}"
 WORK_DIR="${WORK_DIR:-/data/vllm-cpu-nightly-build}"
 IMAGE="ubuntu:22.04"
-
-log() { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
-die() { printf '\033[1;31m[ERR]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ -f "${PYPI_TOKEN_FILE}" ]] || die "PyPI token file not found: ${PYPI_TOKEN_FILE}"
 PYPI_TOKEN="$(tr -d '[:space:]' < "${PYPI_TOKEN_FILE}")"
@@ -73,6 +81,7 @@ docker run -d --name "${CONTAINER_NAME}" \
     -e CC=gcc-12 \
     -e CXX=g++-12 \
     -v "${HOST_OUT_DIR}:/out" \
+    -v "${COMMON_DIR}:/opt/vllm-cpu-nightly-common:ro" \
     "${IMAGE}" \
     sleep infinity >/dev/null
 
@@ -124,62 +133,12 @@ run '
 set -euo pipefail
 cd /src/vllm
 . /opt/venv/bin/activate
+source /opt/vllm-cpu-nightly-common/helpers.sh
 
-# Determine the upstream version that setuptools-scm would have produced
-# for this commit. We deliberately do NOT trust setuptools-scm here:
-# a shallow clone has no reachable tag and scm falls back to "0.1.dev1",
-# which is too low (PyPI would consider it older than the real 0.x.y
-# release line). Instead, fetch all tags and use the latest stable
-# release tag (vX.Y.Z, no rc/a/b suffix), then bump the patch by 1
-# because vLLM `main` is always post-release.
-git fetch --tags --depth=1 origin >/dev/null 2>&1 || true
-LAST_STABLE="$(git tag --sort=-v:refname | grep -E "^v[0-9]+\.[0-9]+\.[0-9]+$" | head -1)"
-LAST_STABLE="${LAST_STABLE:-v0.0.0}"
-BASE_RAW="${LAST_STABLE#v}"
-BASE_VER="$(echo "${BASE_RAW}" | awk -F. "{ printf \"%d.%d.%d\", \$1, \$2, \$3+1 }")"
-echo "Last stable tag : ${LAST_STABLE}"
-echo "Bumped base ver : ${BASE_VER}"
-echo "${BASE_VER}" > /src/base_version.txt
-
-NIGHTLY_VER="${BASE_VER}.dev${STAMP_FULL}"
+NIGHTLY_VER="$(compute_nightly_version "${STAMP_FULL}")"
 echo "${NIGHTLY_VER}" > /src/nightly_version.txt
 
-# Rename the project distribution to PKG_NAME. Only [project].name in
-# pyproject.toml needs to change; the import package (`vllm/`) is
-# untouched so `import vllm` still works.
-python - <<PY
-import pathlib, re
-pkg = "${PKG_NAME}"
-p = pathlib.Path("pyproject.toml")
-txt = p.read_text()
-new = re.sub(r"^(\s*name\s*=\s*[\"\x27])vllm([\"\x27])",
-             lambda m: m.group(1) + pkg + m.group(2),
-             txt, count=1, flags=re.MULTILINE)
-assert new != txt, "failed to patch pyproject.toml name"
-p.write_text(new)
-print(f"Patched name -> {pkg} in pyproject.toml")
-PY
-
-# Patch requirements/cpu.txt: PyPI rejects wheels whose dependencies
-# carry a PEP 440 local label like `torch==2.11.0+cpu`. Strip the +cpu
-# suffix; downstream installers can still pull the cpu wheel with
-# `--extra-index-url https://download.pytorch.org/whl/cpu`.
-sed -i -E "s/torch==([0-9.]+)\+cpu/torch==\1/g" requirements/cpu.txt
-echo "--- patched requirements/cpu.txt ---"
-grep -E "^torch" requirements/cpu.txt || true
-
-# Patch csrc/cpu/sgl-kernels/fla.cpp: it initialises a constexpr float from
-# std::sqrt, which is not constexpr in libc++ before C++26. GCC accepts it
-# as a builtin so Linux is unaffected today, but keep the two build scripts
-# in step so a compiler change does not surprise us. D is a template
-# parameter, so const is semantically identical and still folds.
-FLA_SRC="csrc/cpu/sgl-kernels/fla.cpp"
-if [ -f "$FLA_SRC" ] \
-        && grep -q "constexpr float scale = 1\.f / std::sqrt" "$FLA_SRC"; then
-    sed -i -E "s/constexpr( float scale = 1\.f \/ std::sqrt)/const\1/" "$FLA_SRC"
-    echo "--- patched $FLA_SRC (constexpr -> const) ---"
-    grep -n "float scale = 1\.f / std::sqrt" "$FLA_SRC" || true
-fi
+bash /opt/vllm-cpu-nightly-common/patch_vllm_source.sh
 '
 
 log "Installing build deps + torch(cpu) inside container..."
@@ -187,7 +146,7 @@ run '
 set -euo pipefail
 . /opt/venv/bin/activate
 # Without build isolation we must install everything that
-# pyproject.toml [build-system].requires asks for ourselves.
+# pyproject.toml [build-system].requires asks forourselves.
 pip install "cmake>=3.26.1" ninja "packaging>=24.2" \
     "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8.0" \
     "setuptools-rust>=1.9.0" wheel jinja2 >/dev/null
@@ -202,31 +161,9 @@ fi
 # Plain torch (cpu) so setup.py can `import torch`.
 pip install "numpy<2" >/dev/null
 # Build against exactly the torch this wheel will declare as a dependency.
-# This used to be hardcoded to 2.11.0 while the declared version tracked
-# upstream requirements/cpu.txt; when upstream moved to 2.13.0 the macOS
-# wheel still linked against 2.11 and its _C.abi3.so ended up referencing a
-# c10 symbol the installed torch does not export.
-#
-# requirements/cpu.txt carries one torch line per platform group, each
-# guarded by an environment marker, so taking the first match can pick a pin
-# meant for another architecture -- pip then evaluates the marker, skips the
-# install and still exits 0, leaving the build to fail with "No module named
-# torch". Let packaging evaluate the markers and pick the applicable pin.
-# Absolute path because this step does not cd into the source tree.
-TORCH_REQ="$(python - <<"PYEOF"
-from packaging.requirements import Requirement
-
-with open("/src/vllm/requirements/cpu.txt") as f:
-    for line in f:
-        line = line.split("#", 1)[0].strip()
-        if not line.startswith("torch=="):
-            continue
-        req = Requirement(line)
-        if req.marker is None or req.marker.evaluate():
-            print(req.name + str(req.specifier))
-            break
-PYEOF
-)"
+# See scripts/common/resolve_torch_requirement.py for why we cannot just
+# take the first `torch==` line in requirements/cpu.txt.
+TORCH_REQ="$(python3 /opt/vllm-cpu-nightly-common/resolve_torch_requirement.py /src/vllm/requirements/cpu.txt)"
 : "${TORCH_REQ:?no applicable torch== pin in /src/vllm/requirements/cpu.txt}"
 echo "building against ${TORCH_REQ}"
 pip install "${TORCH_REQ}" \
@@ -248,7 +185,7 @@ run "
     export VLLM_VERSION_OVERRIDE='${NIGHTLY_VER}'
     # vLLM's setup.py defaults to RelWithDebInfo (-O2 -g). The debug symbols
     # pushed this wheel from 96 MiB to 105 MiB, past PyPI's 100 MiB per-file
-    # limit, and uploads have been failing with an opaque 400 ever since.
+    # limit, and uploads have been failing with an opaque 400ever since.
     # Release keeps the optimisation without the symbols.
     export CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE:-Release}'
     export MAX_JOBS=\$(nproc)
@@ -259,81 +196,17 @@ run "
     twine check /out/*.whl
 "
 
-# `twine check` only validates metadata, so it would happily pass a wheel
-# built against a different torch than it declares -- the exact defect that
-# shipped on 2026-07-30. Compare the two versions directly.
-#
-# Do NOT try to dlopen the extensions to verify this. vLLM builds several
-# ISA-specialised variants (_C, _C_AVX2, _C_AVX512) and the default one is
-# compiled with -mavx512* -mamx-*; loading it on a host that lacks those
-# instructions, or that has not requested AMX state via arch_prctl, dies with
-# SIGILL and tells us nothing about the ABI. vLLM picks a variant at runtime
-# after probing the CPU, so "every .so dlopens here" was never the right
-# invariant.
 log "Verifying the wheel declares the torch it was built against..."
 run '
 set -euo pipefail
 . /opt/venv/bin/activate
-python - /out <<"PYEOF"
-import glob
-import sys
-import zipfile
-
-import torch
-
-
-def normalize(version):
-    """Drop the PEP 440 local label, e.g. 2.13.0+cpu -> 2.13.0."""
-    return version.split("+")[0]
-
-
-built = normalize(torch.__version__)
-wheels = glob.glob(sys.argv[1] + "/*.whl")
-if not wheels:
-    sys.exit("no wheel found in " + sys.argv[1])
-
-for whl in wheels:
-    with zipfile.ZipFile(whl) as z:
-        names = [n for n in z.namelist() if n.endswith(".dist-info/METADATA")]
-        if not names:
-            sys.exit("no METADATA in " + whl)
-        text = z.read(names[0]).decode("utf-8", "replace")
-
-    declared = set()
-    for line in text.splitlines():
-        if line.startswith("Requires-Dist: torch=="):
-            spec = line.split("==", 1)[1].split(";")[0].strip()
-            declared.add(normalize(spec))
-
-    if not declared:
-        sys.exit(whl + " declares no pinned torch requirement")
-    if declared != {built}:
-        sys.exit(
-            "ABI mismatch: built against torch %s but the wheel declares %s"
-            % (built, ", ".join(sorted(declared)))
-        )
-    print("torch matches: built against and declares %s" % built)
-PYEOF
+python3 /opt/vllm-cpu-nightly-common/verify_wheel_torch.py /out
 '
 
 log "Wheels staged on host:"
 ls -lh "${HOST_OUT_DIR}"
 
-# PyPI rejects files larger than 100 MiB with an opaque "400 Bad Request".
-# This wheel sat ~3 MiB below that ceiling for weeks, crossed it on
-# 2026-07-20, and every upload failed silently for the next twelve nights.
-# Fail here with an actionable message instead.
-PYPI_MAX_BYTES=$((100 * 1024 * 1024))
-for whl in "${HOST_OUT_DIR}"/*.whl; do
-    size="$(wc -c <"${whl}")"
-    printf '  %s: %d MiB\n' "$(basename "${whl}")" "$((size / 1024 / 1024))"
-    if [[ "${size}" -gt "${PYPI_MAX_BYTES}" ]]; then
-        echo "[ERROR] $(basename "${whl}") is $((size / 1024 / 1024)) MiB," \
-            "over PyPI's 100 MiB per-file limit. Shrink the build (check" \
-            "CMAKE_BUILD_TYPE) or publish somewhere without a size cap." >&2
-        exit 1
-    fi
-done
+check_wheel_size "${HOST_OUT_DIR}"
 
 if [[ "${SKIP_UPLOAD}" == "1" ]]; then
     log "SKIP_UPLOAD=1 -> stopping before twine upload."
