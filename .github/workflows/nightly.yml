@@ -90,11 +90,12 @@ jobs:
             "$RUNNER_TEMP"/vllm-cpu-nightly-build/dist/*.whl \
             "$RUNNER_TEMP/verify-cpu-nightly"
       - name: Upload built wheels
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vllm-cpu-nightly-${{ matrix.platform }}-wheels
           path: ${{ runner.temp }}/vllm-cpu-nightly-build/dist/*.whl
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 14
 
   publish:
@@ -125,7 +126,7 @@ jobs:
   report:
     needs: [source, build, publish]
     if: >-
-      always() && github.repository == 'LMCache/vllm-cpu' &&
+      always() && !cancelled() && github.repository == 'LMCache/vllm-cpu' &&
       (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
       inputs.skip_upload != '1'
     runs-on: ubuntu-24.04

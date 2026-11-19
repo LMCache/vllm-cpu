@@ -56,7 +56,7 @@ def prepare_wheel(path: Path, source_sha: str, built_at: str) -> None:
                 ):
                     continue
                 data = (
-                    metadata.as_bytes()
+                    metadata.as_bytes(policy=policy.compat32.clone(max_line_length=0))
                     if info.filename == metadata_path
                     else source.read(info.filename)
                 )

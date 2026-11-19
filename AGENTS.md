@@ -5,6 +5,9 @@
 - CPU requirements can contain marked direct URLs. PyPI rejects those in
   Requires-Dist even when the marker excludes the upload platform. Preserve
   them in the wheel manifest and install applicable entries during validation.
+- When repacking METADATA with Python's email library, disable automatic header
+  folding (`max_line_length=0`). Folded Summary and long Requires-Dist values
+  are rejected by packaging/twine even though ordinary email accepts them.
 - Resolve one upstream SHA for both builds. Fetch that SHA with `git fetch
   --depth 1`; `git clone --branch <SHA>` cannot check out a raw commit.
 - A GitHub OAuth credential without `workflow` scope cannot push workflow
