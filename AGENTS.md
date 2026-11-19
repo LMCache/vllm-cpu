@@ -15,3 +15,11 @@
 - The Linux script explicitly starts `ubuntu:22.04` with `sleep infinity` and
   verifies GCC 12/Python 3.12 inside it; local Docker on Apple Silicon is ARM64
   and does not replace the native x86_64 GitHub runner.
+- A universal2 Python from setup-python can make bdist_wheel advertise
+  universal2 even when every vLLM extension is arm64-only. Select the wheel
+  platform from the actual arm64 build and deployment target. Check every
+  native `.so`/`.dylib` with `lipo -archs` before installation/publication;
+  an arm64 runtime smoke alone does not validate a universal2 claim.
+- `maobaolong/vllm-cpu` is a standalone mirror, not a GitHub fork of
+  `LMCache/vllm-cpu`. Its branches cannot be used as cross-repository PR
+  heads here. Use a feature branch in `LMCache/vllm-cpu` for producer PRs.

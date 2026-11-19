@@ -25,10 +25,9 @@
 #      vllm-cpu-nightly` always picks the newest one regardless of which
 #      platform produced it (PyPI hosts linux + mac wheels under the same
 #      version stream, pip resolves the right one per-runner).
-#   4. Force `MACOSX_DEPLOYMENT_TARGET=11.0` so the resulting wheel is
-#      tagged `macosx_11_0_arm64` and is installable on every macOS
-#      version that GitHub-hosted `macos-latest` runners use (currently
-#      macOS 14, but the same wheel works on 11+).
+#   4. Set the macOS ABI floor and explicitly tag the arm64 build. A
+#      universal2 Python interpreter does not make Torch's native libraries
+#      universal2. Clean-runtime validation checks every native binary.
 #   5. Twine-upload to PyPI using the API token from
 #      /Users/msy/pypi_apikey (override via PYPI_TOKEN_FILE).
 #
@@ -68,6 +67,7 @@ die() { printf '\033[1;31m[ERR]\033[0m %s\n' "$*" >&2; exit 1; }
 "${PYTHON_BIN}" -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version' \
     || die "PYTHON_BIN must be python 3.12"
 command -v git    >/dev/null || die "git is required"
+command -v lipo   >/dev/null || die "lipo (Xcode command line tools) is required"
 command -v cargo  >/dev/null \
     || die "cargo (rustup) is required for vLLM's setuptools-rust frontend"
 xcode-select -p >/dev/null 2>&1 \
@@ -232,16 +232,23 @@ export VLLM_VERSION_OVERRIDE="${NIGHTLY_VER}"
 export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 # sysctl -n hw.ncpu is the mac equivalent of nproc.
 export MAX_JOBS="$(sysctl -n hw.ncpu)"
-# Force-pin the macOS ABI floor so the produced wheel tag is stable
-# (macosx_11_0_arm64) and consumable on any macOS >= 11.
+# Keep the ABI floor stable; package dependencies retain their own OS floors.
 export MACOSX_DEPLOYMENT_TARGET
 
 rm -rf "${SRC_DIR}/build" "${SRC_DIR}/dist"
-# Note: on macOS we let setup.py / wheel auto-pick the platform tag; we
-# do NOT pass `--plat-name`, because macOS plat tags depend on
-# MACOSX_DEPLOYMENT_TARGET and the host arch and are easy to get wrong
-# manually. The env above pins them deterministically.
-python setup.py bdist_wheel
+# setup-python can provide a universal2 interpreter on an arm64 runner.
+# Select the actual native build architecture rather than Python's own tag.
+wheel_platform="$(python - <<'PY'
+import os
+from packaging.tags import mac_platforms
+parts = [int(part) for part in os.environ["MACOSX_DEPLOYMENT_TARGET"].split(".")]
+target = (parts[0], parts[1] if len(parts) > 1 else 0)
+if target < (11, 0):
+    raise SystemExit("arm64 wheels require MACOSX_DEPLOYMENT_TARGET >= 11.0")
+print(next(mac_platforms(target, "arm64")))
+PY
+)"
+python setup.py bdist_wheel --plat-name "${wheel_platform}"
 
 cp "${SRC_DIR}/dist/"*.whl "${OUT_DIR}/"
 for whl in "${OUT_DIR}/"*.whl; do
