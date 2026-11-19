@@ -99,13 +99,11 @@ python -m pip install --upgrade pip wheel setuptools build twine >/dev/null
 # --- 2. Clone vLLM ----------------------------------------------------------
 log "Cloning vLLM @ ${VLLM_GIT_REF} -> ${SRC_DIR}..."
 rm -rf "${SRC_DIR}"
-git clone --depth 1 --branch "${VLLM_GIT_REF}" \
-    https://github.com/vllm-project/vllm.git "${SRC_DIR}" 2>/dev/null \
-    || git clone https://github.com/vllm-project/vllm.git "${SRC_DIR}"
+git init -q "${SRC_DIR}"
 cd "${SRC_DIR}"
-if [[ "${VLLM_GIT_REF}" != "main" ]]; then
-    git checkout "${VLLM_GIT_REF}"
-fi
+git remote add origin https://github.com/vllm-project/vllm.git
+git fetch --depth 1 origin "${VLLM_GIT_REF}"
+git checkout --detach FETCH_HEAD
 VLLM_COMMIT="$(git rev-parse HEAD)"
 log "vLLM commit: ${VLLM_COMMIT}"
 

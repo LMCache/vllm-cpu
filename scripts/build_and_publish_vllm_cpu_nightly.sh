@@ -112,14 +112,11 @@ run '
 set -euo pipefail
 rm -rf /src/vllm
 mkdir -p /src
-git clone --depth 1 --branch "${VLLM_GIT_REF}" \
-    https://github.com/vllm-project/vllm.git /src/vllm \
-    2>/dev/null \
-    || git clone https://github.com/vllm-project/vllm.git /src/vllm
+git init -q /src/vllm
 cd /src/vllm
-if [ "${VLLM_GIT_REF}" != "main" ]; then
-    git checkout "${VLLM_GIT_REF}"
-fi
+git remote add origin https://github.com/vllm-project/vllm.git
+git fetch --depth 1 origin "${VLLM_GIT_REF}"
+git checkout --detach FETCH_HEAD
 git rev-parse HEAD > /src/vllm_commit.txt
 echo "vLLM commit: $(cat /src/vllm_commit.txt)"
 '
