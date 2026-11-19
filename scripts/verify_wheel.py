@@ -26,7 +26,6 @@ def verify_wheel(wheel: Path, environment: Path) -> None:
             "pip",
             "install",
             str(wheel),
-            "numpy<2",
             "--extra-index-url",
             "https://download.pytorch.org/whl/cpu",
         ],
