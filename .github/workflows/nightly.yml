@@ -1,4 +1,4 @@
-name: Publish verified CPU wheels (2026-11-19 recovery)
+name: Publish architecture-verified CPU wheels (2026-11-19 recovery)
 
 on:
   workflow_dispatch:
@@ -15,58 +15,78 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Require the successful reviewed build
+      - name: Require both successful native builds and clean-runtime checks
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api repos/LMCache/vllm-cpu/actions/runs/44437484846 > run.json
-          gh api repos/LMCache/vllm-cpu/actions/runs/44437484846/jobs?per_page=100 > jobs.json
+          set -euo pipefail
+          gh api repos/LMCache/vllm-cpu/actions/runs/44582643643 > run.json
+          gh api 'repos/LMCache/vllm-cpu/actions/runs/44582643643/jobs?per_page=100' > jobs.json
           python - <<'PY'
           import json
           from pathlib import Path
 
           run = json.loads(Path("run.json").read_text())
-          assert run["head_sha"] == "f74741969325f6c853f22acf3df6e26f29928ac3"
-          assert run["status"] == "completed" and run["conclusion"] == "success"
+          if (run["head_sha"] != "7720bf45b0d74ca7671411728f8f5a11d59f7490"
+                  or run["event"] != "pull_request"
+                  or run["status"] != "completed" or run["conclusion"] != "success"):
+              raise SystemExit("Native run is not the successful expected PR revision")
           jobs = json.loads(Path("jobs.json").read_text())["jobs"]
           for name in ("Build (ubuntu-22.04)", "Build (macos-latest)"):
-              assert any(j["name"] == name and j["conclusion"] == "success" for j in jobs)
+              matches = [j for j in jobs if j["name"] == name]
+              if len(matches) != 1 or matches[0]["conclusion"] != "success":
+                  raise SystemExit(f"Missing successful native job: {name}")
+              steps = {s["name"]: s["conclusion"] for s in matches[0]["steps"]}
+              for step in ("Check wheel preparation regressions", "Build publishable wheel without credentials", "Verify wheel in a clean runtime", "Upload built wheels"):
+                  if steps.get(step) != "success":
+                      raise SystemExit(f"Required step failed: {name}: {step}")
           PY
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
-          run-id: 44437484846
+          run-id: 44582643643
           pattern: vllm-cpu-nightly-*-wheels
           merge-multiple: true
           path: dist
-      - name: Verify matching platform wheels and provenance
+      - name: Verify exact audited wheel bytes and matching source
         run: |
           python - <<'PY'
+          from datetime import datetime, timedelta, timezone
           import email
           import hashlib
           import json
           from pathlib import Path
           import zipfile
 
+          expected = {'vllm_cpu_nightly-0.34.1.dev202611191847-cp312-cp312-manylinux_2_28_x86_64.whl': '8f38b6e575a3fb093f3ca11b1dbf03996a9707260aecf03a673296e90813b05c', 'vllm_cpu_nightly-0.34.1.dev202611191847-cp312-cp312-macosx_11_0_arm64.whl': '341e4c250a4fd323631f924bdde21fa1091a94a919eed8e706de7a8fb8d22001'}
           wheels = list(Path("dist").glob("*.whl"))
-          assert len(wheels) == 2
-          assert sum("manylinux" in p.name for p in wheels) == 1
-          assert sum("macosx" in p.name for p in wheels) == 1
+          if {p.name for p in wheels} != set(expected) or len(wheels) != 2:
+              raise SystemExit("Downloaded wheel set differs from the audited native pair")
           for wheel in wheels:
+              digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+              if digest != expected[wheel.name]:
+                  raise SystemExit(f"Artifact digest changed: {wheel.name}")
               with zipfile.ZipFile(wheel) as archive:
                   metadata_name = next(n for n in archive.namelist() if n.endswith(".dist-info/METADATA"))
                   metadata = email.message_from_bytes(archive.read(metadata_name))
-                  manifest = json.loads(archive.read(metadata_name.rsplit("/", 1)[0] + "/cpu-nightly.json"))
-              assert metadata["Name"] == "vllm-cpu-nightly"
-              assert metadata["Version"] == "0.34.1.dev202611190133"
-              assert manifest["source_sha"] == "8700cc9ba0016bf14d8f2756f3b673e93fbcf2fd"
-              print(wheel.name, hashlib.sha256(wheel.read_bytes()).hexdigest(), manifest["source_sha"])
+                  info = metadata_name.rsplit("/", 1)[0]
+                  manifest = json.loads(archive.read(info + "/cpu-nightly.json"))
+              if metadata["Name"] != "vllm-cpu-nightly" or metadata["Version"] != "0.34.1.dev202611191847":
+                  raise SystemExit("Unexpected distribution/version")
+              if manifest["source_sha"] != "b2c92fa9c1d8be6790ddd0852b547bbf927bfbd0":
+                  raise SystemExit("Mismatched upstream source")
+              if any(" @ " in r for r in metadata.get_all("Requires-Dist", [])):
+                  raise SystemExit("Direct URL requirement cannot be uploaded to PyPI")
+              age = datetime.now(timezone.utc) - datetime.fromisoformat(manifest["built_at"].replace("Z", "+00:00"))
+              if not timedelta(minutes=-15) <= age < timedelta(hours=48):
+                  raise SystemExit("Audited wheel is stale or future dated")
+              print(wheel.name, digest, manifest["source_sha"])
           PY
-      - name: Check and publish the verified wheels
+      - name: Check and publish the exact verified wheels
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
           python -m pip install twine
           twine check dist/*.whl
-          twine upload --verbose --non-interactive --disable-progress-bar dist/*.whl
+          twine upload --non-interactive --disable-progress-bar dist/*.whl
