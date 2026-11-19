@@ -84,6 +84,11 @@ jobs:
           PYTHON_BIN: ${{ steps.python.outputs.python-path }}
           BUILD_SCRIPT: ${{ matrix.script }}
         run: bash "scripts/${BUILD_SCRIPT}"
+      - name: Verify wheel in a clean runtime
+        run: |
+          python scripts/verify_wheel.py \
+            "$RUNNER_TEMP"/vllm-cpu-nightly-build/dist/*.whl \
+            "$RUNNER_TEMP/verify-cpu-nightly"
       - name: Upload built wheels
         uses: actions/upload-artifact@v4
         with:
