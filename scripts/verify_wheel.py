@@ -72,8 +72,14 @@ metadata.write_text(metadata.read_text().replace("Name: vllm-cpu-nightly", "Name
             """
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.platforms import current_platform
+import torch
 current_platform.import_kernels()
-print("Native CPU kernels imported; on_kv_cache_ready:", hasattr(KVConnectorBase_V1, "on_kv_cache_ready"))
+values = torch.arange(128, dtype=torch.float32).reshape(2, 64) / 64
+output = torch.empty_like(values)
+torch.ops._C.rms_norm(output, values, torch.ones(64), 1e-6)
+expected = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + 1e-6)
+torch.testing.assert_close(output, expected)
+print("Native CPU rms_norm passed; on_kv_cache_ready:", hasattr(KVConnectorBase_V1, "on_kv_cache_ready"))
 """,
         ],
         env=env,
