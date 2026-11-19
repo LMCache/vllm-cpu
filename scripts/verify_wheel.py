@@ -8,15 +8,57 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import venv
 from pathlib import Path
 from zipfile import ZipFile
 
 from packaging.requirements import Requirement
+from packaging.utils import parse_wheel_filename
+
+
+def verify_macos_architectures(wheel: Path) -> None:
+    """Reject macOS tags that promise architectures missing from native code."""
+    _, _, _, tags = parse_wheel_filename(wheel.name)
+    architectures = {
+        "arm64": {"arm64"},
+        "x86_64": {"x86_64"},
+        "universal2": {"arm64", "x86_64"},
+    }
+    required = set()
+    for tag in tags:
+        if not tag.platform.startswith("macosx_"):
+            continue
+        for suffix, arches in architectures.items():
+            if tag.platform.endswith("_" + suffix):
+                required.update(arches)
+                break
+        else:
+            raise ValueError(f"Unsupported macOS platform tag: {tag.platform}")
+    if not required:
+        return
+    with ZipFile(wheel) as archive, tempfile.TemporaryDirectory() as scratch:
+        for name in archive.namelist():
+            if not name.endswith((".so", ".dylib")):
+                continue
+            binary = Path(scratch) / "native"
+            binary.write_bytes(archive.read(name))
+            actual = set(
+                subprocess.check_output(
+                    ["lipo", "-archs", str(binary)], text=True
+                ).split()
+            )
+            if not required.issubset(actual):
+                raise ValueError(
+                    f"{wheel.name} promises {sorted(required)}, but {name} "
+                    f"contains {sorted(actual)}"
+                )
+            print(f"Native architecture: {name}: {sorted(actual)}")
 
 
 def verify_wheel(wheel: Path, environment: Path) -> None:
     """Install a CPU wheel and exercise its CLI and startup hook imports."""
+    verify_macos_architectures(wheel)
     venv.create(environment, with_pip=True)
     python = str(environment / "bin/python")
     subprocess.run(
