@@ -1,37 +1,23 @@
 name: Nightly build & publish vllm-cpu
 
-# Builds CPU-only vLLM wheels for both Linux (ubuntu-22.04) and macOS
-# (macos-latest), uploads them to PyPI as `vllm-cpu-nightly`, and re-runs
-# every day so consumers can `pip install --upgrade vllm-cpu-nightly`.
-#
-# Triggers:
-#   * schedule  -> every day at 06:00 UTC (~14:00 Beijing time).
-#   * manual    -> Actions tab > Run workflow,
-#                  or `gh workflow run nightly.yml -R opendataio/vllm-cpu`.
-#
-# Required repository secret:
-#   PYPI_TOKEN  -> a PyPI API token that owns the `vllm-cpu-nightly`
-#                  project (or has upload permission to it).
-
 on:
   schedule:
     - cron: "0 6 * * *"
+  pull_request:
   workflow_dispatch:
     inputs:
       vllm_git_ref:
-        description: "vLLM git ref (branch / tag / sha). Default: main"
-        required: false
+        description: "vLLM branch, tag or SHA"
         default: "main"
       skip_upload:
-        description: "Build only, do not upload to PyPI (1 = skip)"
-        required: false
+        description: "Build only (1) or publish both platforms to PyPI (0)"
         default: "0"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -39,95 +25,123 @@ defaults:
     shell: bash
 
 jobs:
-  build-ubuntu:
-    name: Build & publish (ubuntu-22.04)
-    runs-on: ubuntu-22.04
+  source:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      timestamp: ${{ steps.resolve.outputs.timestamp }}
+    steps:
+      - name: Resolve one upstream revision for both platforms
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VLLM_REF: ${{ inputs.vllm_git_ref || 'main' }}
+        run: |
+          sha=$(gh api "repos/vllm-project/vllm/commits/${VLLM_REF}" --jq .sha)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: source
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux
+            script: build_and_publish_vllm_cpu_nightly.sh
+          - os: macos-latest
+            platform: macos
+            script: build_and_publish_vllm_cpu_nightly_macos.sh
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Stage PyPI token
-        env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          if [[ -z "${PYPI_TOKEN}" ]]; then
-            echo "::error::PYPI_TOKEN secret is not configured"
-            exit 1
-          fi
-          umask 077 && : > "${RUNNER_TEMP}/pypi_apikey"
-          printf '%s' "${PYPI_TOKEN}" > "${RUNNER_TEMP}/pypi_apikey"
-
-      - name: Run build & publish script
-        env:
-          PYPI_TOKEN_FILE: ${{ runner.temp }}/pypi_apikey
-          VLLM_GIT_REF: ${{ github.event.inputs.vllm_git_ref || 'main' }}
-          SKIP_UPLOAD: ${{ github.event.inputs.skip_upload || '0' }}
-          # The script's default WORK_DIR (/data/...) does not exist on
-          # GitHub-hosted runners; redirect to the runner's temp dir.
-          WORK_DIR: ${{ runner.temp }}/vllm-cpu-nightly-build
-        run: |
-          chmod +x scripts/build_and_publish_vllm_cpu_nightly.sh
-          bash scripts/build_and_publish_vllm_cpu_nightly.sh
-
-      - name: Upload built wheels (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vllm-cpu-nightly-linux-wheels
-          path: ${{ runner.temp }}/vllm-cpu-nightly-build/dist/*.whl
-          if-no-files-found: ignore
-          retention-days: 14
-
-  build-macos:
-    name: Build & publish (macos-latest)
-    runs-on: macos-latest
-    timeout-minutes: 90
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.12
-        id: setup-python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.12"
-
-      - name: Install rustup (cargo)
+      - name: Check wheel preparation regressions
+        run: |
+          python -m pip install pytest wheel packaging
+          python -m pytest tests -q
+      - name: Install cargo on macOS
+        if: runner.os == 'macOS'
         run: |
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
               | sh -s -- -y --default-toolchain stable -q
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
-
-      - name: Stage PyPI token
+      - name: Build publishable wheel without credentials
         env:
-          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          if [[ -z "${PYPI_TOKEN}" ]]; then
-            echo "::error::PYPI_TOKEN secret is not configured"
-            exit 1
-          fi
-          umask 077 && : > "${RUNNER_TEMP}/pypi_apikey"
-          printf '%s' "${PYPI_TOKEN}" > "${RUNNER_TEMP}/pypi_apikey"
-
-      - name: Run build & publish script
-        env:
-          PYPI_TOKEN_FILE: ${{ runner.temp }}/pypi_apikey
-          VLLM_GIT_REF: ${{ github.event.inputs.vllm_git_ref || 'main' }}
-          SKIP_UPLOAD: ${{ github.event.inputs.skip_upload || '0' }}
-          WORK_DIR: ${{ runner.temp }}/vllm-cpu-nightly-build-macos
-          PYTHON_BIN: ${{ steps.setup-python.outputs.python-path }}
-        run: |
-          chmod +x scripts/build_and_publish_vllm_cpu_nightly_macos.sh
-          bash scripts/build_and_publish_vllm_cpu_nightly_macos.sh
-
-      - name: Upload built wheels (artifact)
-        if: always()
+          VLLM_GIT_REF: ${{ needs.source.outputs.sha }}
+          NIGHTLY_BUILD_TIMESTAMP: ${{ needs.source.outputs.timestamp }}
+          SKIP_UPLOAD: "1"
+          WORK_DIR: ${{ runner.temp }}/vllm-cpu-nightly-build
+          PYTHON_BIN: ${{ steps.python.outputs.python-path }}
+          BUILD_SCRIPT: ${{ matrix.script }}
+        run: bash "scripts/${BUILD_SCRIPT}"
+      - name: Upload built wheels
         uses: actions/upload-artifact@v4
         with:
-          name: vllm-cpu-nightly-macos-wheels
-          path: ${{ runner.temp }}/vllm-cpu-nightly-build-macos/dist/*.whl
-          if-no-files-found: ignore
+          name: vllm-cpu-nightly-${{ matrix.platform }}-wheels
+          path: ${{ runner.temp }}/vllm-cpu-nightly-build/dist/*.whl
+          if-no-files-found: error
           retention-days: 14
+
+  publish:
+    needs: build
+    if: >-
+      github.repository == 'LMCache/vllm-cpu' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      inputs.skip_upload != '1'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vllm-cpu-nightly-*-wheels
+          merge-multiple: true
+          path: dist
+      - name: Publish both platform wheels
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          python -m pip install twine
+          twine check dist/*.whl
+          twine upload --verbose --non-interactive --disable-progress-bar dist/*.whl
+
+  report:
+    needs: [source, build, publish]
+    if: >-
+      always() && github.repository == 'LMCache/vllm-cpu' &&
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      inputs.skip_upload != '1'
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Track failed builds and publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          issue=$(gh issue list --state open --search '"CPU nightly publication failed" in:title' --json number --jq '.[0].number // empty')
+          if [[ "$PUBLISH_RESULT" == success ]]; then
+            if [[ -n "$issue" ]]; then
+              gh issue close "$issue" --comment "Publication recovered: $RUN_URL"
+            fi
+          elif [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body "Build or publication failed: $RUN_URL"
+          else
+            gh issue create --title 'CPU nightly publication failed' --body "Build or publication failed: $RUN_URL"
+          fi

@@ -37,6 +37,8 @@
 # ----------------------------------------------------------------------------
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PYPI_TOKEN_FILE="${PYPI_TOKEN_FILE:-/data/home/baoloongmao/pypi_apikey}"
 PKG_NAME="${PKG_NAME:-vllm-cpu-nightly}"
 VLLM_GIT_REF="${VLLM_GIT_REF:-main}"
@@ -47,15 +49,17 @@ IMAGE="ubuntu:22.04"
 log() { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf '\033[1;31m[ERR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[[ -f "${PYPI_TOKEN_FILE}" ]] || die "PyPI token file not found: ${PYPI_TOKEN_FILE}"
-PYPI_TOKEN="$(tr -d '[:space:]' < "${PYPI_TOKEN_FILE}")"
-[[ -n "${PYPI_TOKEN}" ]] || die "PyPI token file is empty"
+if [[ "${SKIP_UPLOAD}" != "1" ]]; then
+    [[ -f "${PYPI_TOKEN_FILE}" ]] || die "PyPI token file not found: ${PYPI_TOKEN_FILE}"
+    PYPI_TOKEN="$(tr -d '[:space:]' < "${PYPI_TOKEN_FILE}")"
+    [[ -n "${PYPI_TOKEN}" ]] || die "PyPI token file is empty"
+fi
 
 mkdir -p "${WORK_DIR}"
 HOST_OUT_DIR="${WORK_DIR}/dist"
 mkdir -p "${HOST_OUT_DIR}"
 
-STAMP_FULL="$(date -u +%Y%m%d%H%M)"
+STAMP_FULL="${NIGHTLY_BUILD_TIMESTAMP:-$(date -u +%Y%m%d%H%M)}"
 
 log "Pulling ${IMAGE} (no-op if already present)..."
 docker pull "${IMAGE}" >/dev/null
@@ -73,6 +77,7 @@ docker run -d --name "${CONTAINER_NAME}" \
     -e CC=gcc-12 \
     -e CXX=g++-12 \
     -v "${HOST_OUT_DIR}:/out" \
+    -v "${SCRIPT_DIR}:/nightly-scripts:ro" \
     "${IMAGE}" \
     sleep infinity >/dev/null
 
@@ -256,6 +261,11 @@ run "
     python setup.py bdist_wheel --plat-name manylinux_2_28_x86_64
     cp /src/vllm/dist/*.whl /out/
     ls -lh /out/
+    for whl in /out/*.whl; do
+        python /nightly-scripts/prepare_wheel.py \"\$whl\" \
+            \"\$(cat /src/vllm_commit.txt)\" \
+            \"\$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+    done
     twine check /out/*.whl
 "
 
@@ -347,7 +357,7 @@ docker exec \
     "${CONTAINER_NAME}" \
     bash -ec '
         . /opt/venv/bin/activate
-        twine upload --non-interactive --disable-progress-bar /out/*.whl
+        twine upload --verbose --non-interactive --disable-progress-bar /out/*.whl
     '
 
 log "Done. Index page: https://pypi.org/project/${PKG_NAME}/"
