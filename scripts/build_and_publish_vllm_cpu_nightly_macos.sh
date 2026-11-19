@@ -46,6 +46,8 @@
 # ----------------------------------------------------------------------------
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PYPI_TOKEN_FILE="${PYPI_TOKEN_FILE:-/Users/msy/pypi_apikey}"
 PKG_NAME="${PKG_NAME:-vllm-cpu-nightly}"
 VLLM_GIT_REF="${VLLM_GIT_REF:-main}"
@@ -71,9 +73,11 @@ command -v cargo  >/dev/null \
 xcode-select -p >/dev/null 2>&1 \
     || die "Xcode command line tools required (run: xcode-select --install)"
 
-[[ -f "${PYPI_TOKEN_FILE}" ]] || die "PyPI token file not found: ${PYPI_TOKEN_FILE}"
-PYPI_TOKEN="$(tr -d '[:space:]' < "${PYPI_TOKEN_FILE}")"
-[[ -n "${PYPI_TOKEN}" ]] || die "PyPI token file is empty"
+if [[ "${SKIP_UPLOAD}" != "1" ]]; then
+    [[ -f "${PYPI_TOKEN_FILE}" ]] || die "PyPI token file not found: ${PYPI_TOKEN_FILE}"
+    PYPI_TOKEN="$(tr -d '[:space:]' < "${PYPI_TOKEN_FILE}")"
+    [[ -n "${PYPI_TOKEN}" ]] || die "PyPI token file is empty"
+fi
 
 mkdir -p "${WORK_DIR}"
 SRC_DIR="${WORK_DIR}/vllm"
@@ -81,7 +85,7 @@ VENV_DIR="${WORK_DIR}/venv"
 OUT_DIR="${WORK_DIR}/dist"
 mkdir -p "${OUT_DIR}"
 
-STAMP_FULL="$(date -u +%Y%m%d%H%M)"
+STAMP_FULL="${NIGHTLY_BUILD_TIMESTAMP:-$(date -u +%Y%m%d%H%M)}"
 
 # --- 1. Bootstrap an isolated venv -----------------------------------------
 log "Creating venv at ${VENV_DIR} (python: ${PYTHON_BIN})..."
@@ -95,13 +99,11 @@ python -m pip install --upgrade pip wheel setuptools build twine >/dev/null
 # --- 2. Clone vLLM ----------------------------------------------------------
 log "Cloning vLLM @ ${VLLM_GIT_REF} -> ${SRC_DIR}..."
 rm -rf "${SRC_DIR}"
-git clone --depth 1 --branch "${VLLM_GIT_REF}" \
-    https://github.com/vllm-project/vllm.git "${SRC_DIR}" 2>/dev/null \
-    || git clone https://github.com/vllm-project/vllm.git "${SRC_DIR}"
+git init -q "${SRC_DIR}"
 cd "${SRC_DIR}"
-if [[ "${VLLM_GIT_REF}" != "main" ]]; then
-    git checkout "${VLLM_GIT_REF}"
-fi
+git remote add origin https://github.com/vllm-project/vllm.git
+git fetch --depth 1 origin "${VLLM_GIT_REF}"
+git checkout --detach FETCH_HEAD
 VLLM_COMMIT="$(git rev-parse HEAD)"
 log "vLLM commit: ${VLLM_COMMIT}"
 
@@ -242,6 +244,10 @@ rm -rf "${SRC_DIR}/build" "${SRC_DIR}/dist"
 python setup.py bdist_wheel
 
 cp "${SRC_DIR}/dist/"*.whl "${OUT_DIR}/"
+for whl in "${OUT_DIR}/"*.whl; do
+    python "${SCRIPT_DIR}/prepare_wheel.py" "${whl}" "${VLLM_COMMIT}" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+done
 ls -lh "${OUT_DIR}/"
 twine check "${OUT_DIR}/"*.whl
 
@@ -325,7 +331,7 @@ fi
 log "Uploading to PyPI via twine..."
 TWINE_USERNAME="__token__" \
 TWINE_PASSWORD="${PYPI_TOKEN}" \
-    twine upload --non-interactive --disable-progress-bar "${OUT_DIR}/"*.whl
+    twine upload --verbose --non-interactive --disable-progress-bar "${OUT_DIR}/"*.whl
 
 log "Done. Index page: https://pypi.org/project/${PKG_NAME}/"
 log "Install with:    pip install ${PKG_NAME}"

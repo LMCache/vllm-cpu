@@ -20,9 +20,9 @@ projects (e.g. LMCache CPU device tests) just `pip install` the wheel.
   Run workflow* button, or:
 
   ```bash
-  gh workflow run nightly.yml -R opendataio/vllm-cpu
+  gh workflow run nightly.yml -R LMCache/vllm-cpu
   # optional inputs:
-  gh workflow run nightly.yml -R opendataio/vllm-cpu \
+  gh workflow run nightly.yml -R LMCache/vllm-cpu \
       -f vllm_git_ref=main \
       -f skip_upload=0
   ```
@@ -59,6 +59,39 @@ The `--extra-index-url` is required on Linux because the wheel depends on
 `torch==2.11.0` (CPU build), which only lives on the PyTorch index.
 On macOS arm64 the default PyPI torch wheel is already CPU-only so the
 extra index is harmless.
+
+PyPI rejects direct URL dependencies in wheel metadata. The wheel preserves
+these dependencies, including Triton CPU, in its `cpu-nightly.json` dist-info
+manifest. After installing, install the requirements matching your platform:
+
+```bash
+python - <<'PY'
+import importlib.metadata as md
+import json
+import subprocess
+import sys
+from packaging.requirements import Requirement
+
+manifest = json.loads(md.distribution("vllm-cpu-nightly").read_text("cpu-nightly.json"))
+requirements = []
+for text in manifest["direct_requirements"]:
+    requirement = Requirement(text)
+    if requirement.marker is None or requirement.marker.evaluate():
+        requirements.append(text)
+if requirements:
+    subprocess.run([sys.executable, "-m", "pip", "install", *requirements], check=True)
+print("vLLM source:", manifest["source_sha"], "built:", manifest["built_at"])
+PY
+```
+
+LMCache's CPU installer performs this step automatically. PR builds and manual
+`skip_upload=1` builds require no PyPI token. Both platforms build the same
+resolved upstream SHA and timestamp; publication starts after both pass.
+
+Publication failures open or update a tracking issue. GitHub can disable a
+scheduled workflow after repository inactivity; downstream freshness checks
+must detect that case independently. Re-enable the workflow with
+`gh workflow enable nightly.yml -R LMCache/vllm-cpu` after repairing it.
 
 ## Layout
 
