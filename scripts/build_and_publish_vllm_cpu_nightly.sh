@@ -170,6 +170,27 @@ sed -i -E "s/torch==([0-9.]+)\+cpu/torch==\1/g" requirements/cpu.txt
 echo "--- patched requirements/cpu.txt ---"
 grep -E "^torch" requirements/cpu.txt || true
 
+# Patch requirements/cpu.txt: pin triton-cpu to the ISA-fixed rebuild.
+# The released v3.8.0 wheel builds its LLVM target machine from the CPU model
+# name with an empty feature string, so codegen ignores the CPUID/XCR0-sanitised
+# llvm.get_cpu_features(). On a host whose model implies AVX-512 while the OS
+# never enabled that state, kernels come out with %zmm/EVEX and trap with
+# SIGILL on the first launch (LMCache/LMCache#6851). The wheels below are tag
+# v3.8.0 plus triton-lang/triton-cpu#314, built by
+# .github/workflows/build_triton_cpu_wheel.yml. Delete this block once the
+# upstream pin itself carries that fix.
+TRITON_CPU_FIX=https://github.com/LMCache/vllm-cpu/releases/download/triton-cpu-3.8.0-isa-fix
+sed -i -E "s#triton @ .*cp311-cp311.*\.whl#triton @ ${TRITON_CPU_FIX}/triton-3.8.0+cpu.isa1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#" requirements/cpu.txt
+sed -i -E "s#triton @ .*cp312-abi3.*\.whl#triton @ ${TRITON_CPU_FIX}/triton-3.8.0+cpu.isa1-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#" requirements/cpu.txt
+if [ "$(grep -c "${TRITON_CPU_FIX}" requirements/cpu.txt)" -ne 2 ]; then
+    echo "error: requirements/cpu.txt no longer pins both triton-cpu wheels." >&2
+    echo "       Upstream may have moved the pin - re-check the ISA fix." >&2
+    grep triton requirements/cpu.txt >&2 || true
+    exit 1
+fi
+echo "--- patched triton-cpu pin ---"
+grep triton requirements/cpu.txt
+
 # Patch csrc/cpu/sgl-kernels/fla.cpp: it initialises a constexpr float from
 # std::sqrt, which is not constexpr in libc++ before C++26. GCC accepts it
 # as a builtin so Linux is unaffected today, but keep the two build scripts
