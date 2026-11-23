@@ -1,0 +1,113 @@
+name: Build triton-cpu wheel with the ISA fix
+
+# The CPU nightly pins triton-cpu's v3.8.0 wheel, which builds its LLVM
+# TargetMachine from the CPU model name with an empty feature string
+# (third_party/cpu/llvm.cc), so codegen ignores the CPUID/XCR0-sanitised
+# llvm.get_cpu_features(). On a host whose model implies AVX-512 while the OS
+# never enabled that state, kernels are compiled with %zmm/EVEX and trap with
+# SIGILL on the first launch (LMCache/LMCache#6851).
+#
+# Upstream fixed it in triton-lang/triton-cpu#314 (0f289cec, 2026-10-07), but
+# there is still no release carrying it: v3.8.0+cpu (2026-09-22) is the newest
+# wheel anywhere (the Triton-Nightly feed has no cpu builds). This workflow
+# rebuilds the released v3.8.0 tree with that patch applied and publishes the
+# result as a release asset, so the nightly can pin a wheel that behaves like
+# the released one except for the fix.
+#
+# Once triton-cpu publishes a release containing #314, delete this workflow,
+# patches/triton-cpu-314.patch and the pin rewrite in
+# scripts/build_and_publish_vllm_cpu_nightly.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_tag:
+        description: "Release tag to publish the wheels under"
+        required: true
+        default: triton-cpu-3.8.0-isa-fix
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.variant.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: cp311
+            cibw_build: "cp311-manylinux_x86_64"
+            cibw_environment: "MAX_JOBS=3 TRITON_EXT_ENABLED=ON TRITON_BUILD_WITH_CLANG_LLD=1 TRITON_WHEEL_VERSION_SUFFIX=isa1"
+          - name: cp312-abi3
+            cibw_build: "cp312-manylinux_x86_64"
+            cibw_environment: "MAX_JOBS=3 TRITON_EXT_ENABLED=ON TRITON_BUILD_WITH_CLANG_LLD=1 TRITON_STABLE_ABI=ON TRITON_WHEEL_VERSION_SUFFIX=isa1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check out triton-cpu v3.8.0 and apply the fix
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v3.8.0 \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/triton-lang/triton-cpu.git triton-cpu
+          cd triton-cpu
+          git apply ../patches/triton-cpu-314.patch
+          # A release branch keeps setup.py's git-hash suffix out of the
+          # version, so the wheel is triton-3.8.0+cpu.isa1 as advertised.
+          git checkout -b release/triton-cpu-3.8.0-isa-fix
+          grep -c "getCPUFeaturesString" third_party/cpu/llvm.cc || true
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        working-directory: triton-cpu
+        env:
+          CIBW_BUILD: ${{ matrix.variant.cibw_build }}
+          CIBW_ENVIRONMENT: ${{ matrix.variant.cibw_environment }}
+          CIBW_BEFORE_ALL: "dnf install clang lld -y"
+          CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:latest
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libtriton.so -w {dest_dir} {wheel}"
+        run: |
+          set -euo pipefail
+          # Mirrors triton-cpu's own .github/workflows/wheels.yml, minus the
+          # extra interpreters: the abi3 wheel covers 3.12+, cp311 covers 3.11.
+          printf "\n[build_ext]\nbase-dir=/project\n" >> python/setup.cfg
+          python -m pip install --upgrade pip cibuildwheel
+          docker pull "${CIBW_MANYLINUX_X86_64_IMAGE}"
+          python -m cibuildwheel . --output-dir wheelhouse
+          ls -l wheelhouse
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: triton-cpu-${{ matrix.variant.name }}
+          path: triton-cpu/wheelhouse/*.whl
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          pattern: triton-cpu-*
+          merge-multiple: true
+          path: wheels
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.publish_tag }}
+        run: |
+          set -euo pipefail
+          ls -l wheels
+          gh release view "${TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "${TAG}" --repo "$GITHUB_REPOSITORY" \
+                 --title "triton-cpu 3.8.0 + ISA fix (#314)" \
+                 --notes "Rebuild of triton-lang/triton-cpu v3.8.0 with triton-lang/triton-cpu#314 applied (third_party/cpu/llvm.cc only). Delete once upstream publishes a release containing that commit."
+          gh release upload "${TAG}" wheels/*.whl --repo "$GITHUB_REPOSITORY" --clobber
